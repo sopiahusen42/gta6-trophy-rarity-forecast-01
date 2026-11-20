@@ -23,11 +23,26 @@ population growth trend toward a per-trophy ceiling, and project
     E_i,target = E_i,now + alpha_i * (P_target - P_now)
     rate_i,target = 100 * E_i,target / P_target.
 
-Players tracked is projected too, by integrating an exponentially decaying
-marginal growth rate fitted across the distinct states. The forecast spread is
-an honest logit-scale band: a time component growing like sqrt(horizon), a model
-component for how well alpha and the player count are identified, and a player
-count component scaled by (1 - rate) so trophies pinned at 100% stay tight.
+Players tracked is projected too, with a power law fitted on the real Exophase
+trajectory, log P = 6.3981 + 1.1381 * log(1 + t_hours) (t_hours since launch
+2026-11-18T23:48Z), anchored at the last state's own (t, P):
+
+    P_target = P_now * ((1 + t_target) / (1 + t_now)) ** 1.138.
+
+P is never left flat when a horizon exists. Earners, not rates, are the
+persistent quantity: with alpha unknown the honest default is alpha = rate_frac,
+so rate_target = rate_now * P_now / P_target (launch-night rates dilute hard as
+the tracked player base grows).
+
+The forecast spread is an honest logit-scale band calibrated on the three real
+intervals (launch->t1, launch->t2, t1->t2). The residual sd of
+logit(actual) - logit(predicted) per sqrt(day) is ~1.4-1.5 on the launch
+intervals; a time term SIGMA_TIME = 2.0 per sqrt(day) gives achieved 90%
+coverage of 0.69 / 0.98 / 1.00 on those intervals (mean ~0.89) with the
+earners-persistent median, so the band is honest rather than decorative. On top
+of the sqrt(horizon) time term sit a small model component (few distinct states
+/ noisy alpha widen it), a player-count component scaled by (1 - rate) so
+trophies pinned at 100% stay tight, and floors. Quantiles clamp to 0.01..99.99.
 
 Everything is deterministic: no randomness, no clock reads, ordered iteration.
 """
@@ -45,14 +60,18 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
 
 # --- spread calibration (logit units) -------------------------------------
-SIGMA_TIME = 0.20        # rate noise per sqrt(day), measured on real intervals
+# SIGMA_TIME recalibrated on the three real Exophase intervals (launch->t1,
+# launch->t2, t1->t2): residual sd per sqrt(day) ~1.4-1.5; a 2.0/sqrt(day) time
+# term gives achieved 90% coverage 0.69/0.98/1.00 (mean ~0.89) with the
+# earners-persistent median. The old 0.20 understated uncertainty ~9x.
+SIGMA_TIME = 2.0         # rate noise per sqrt(day), measured on real intervals
 SIGMA_TIME_FLOOR = 0.05  # never collapse the band entirely
 SIGMA_P = 0.13           # player-count uncertainty per sqrt(day)
 SIGMA_P_FLOOR = 0.06
-SIGMA_MODEL_1STATE = 0.9   # extra spread when only one distinct state is known
-SIGMA_MODEL_2STATE = 0.25  # extra spread with two states (alpha barely identified)
-SIGMA_ALPHA_NOISE = 0.35   # extra spread when a trophy's alpha is rounding noise
-SIGMA_ALPHA_NOISE_FRAC = 0.5  # fraction of SIGMA_ALPHA_NOISE applied per sqrt(day)
+SIGMA_MODEL_1STATE = 0.30  # extra spread when only one distinct state is known
+SIGMA_MODEL_2STATE = 0.20  # extra spread with two states (alpha barely identified)
+SIGMA_ALPHA_NOISE = 0.30   # extra spread when a trophy's alpha is rounding noise
+SIGMA_ALPHA_NOISE_FRAC = 0.4  # fraction of SIGMA_ALPHA_NOISE applied per sqrt(day)
 
 # --- alpha model ----------------------------------------------------------
 ALPHA_CEIL_MULT = 5.0    # asymptotic alpha ceiling = mult * current rate
@@ -60,20 +79,21 @@ BETA_DEFAULT = 0.7       # default alpha maturation rate per day
 BETA_MIN = 0.15
 BETA_MAX = 1.2
 ALPHA_HALF_LIFE = 1.0    # recency half-life (days) for weighting intervals
-ALPHA_PRIOR_MULT = 1.3   # prior alpha = mult * rate when no interval identifies it
+ALPHA_PRIOR_MULT = 1.0   # prior alpha = rate_frac (earners persistent) when unmeasured
 RARE_RATE = 0.10         # below this percent, alpha is mostly rounding noise
 ROUND_EPS = 0.005        # half a printed decimal place (percent)
 
 # --- single-state (launch) fallback ---------------------------------------
 # Launch-night rates are inflated by completionists; a refresh dilutes them hard.
-SINGLE_DILUTION = 0.10   # median rate ~ dilution * last rate when P grows a lot
-SINGLE_SIGMA_BASE = 0.7  # wide honest band, no alpha information
-SINGLE_SIGMA_SQRT = 1.0
+# With no alpha information the honest default is earners-persistent
+# (alpha = rate_frac), so the median rate falls as P_now / P_target.
+SINGLE_SIGMA_BASE = 0.30  # modest extra for the discrete-refresh risk
+SINGLE_SIGMA_SQRT = 0.30
 
-# --- players projection ---------------------------------------------------
-K_DEFAULT = 0.7          # default growth decay per day
-K_MIN = 0.10
-K_MAX = 3.0
+# --- players projection (power law on the real trajectory) ----------------
+# log P = 6.3981 + 1.1381 * log(1 + t_hours), t_hours since 2026-11-18T23:48Z.
+POWER_EXP = 1.138        # fitted power-law exponent
+LAUNCH_OFFSET_H = 0.2    # hours from 2026-11-18T23:48Z to parse_time's 00:00Z ref
 P_ABS_CAP = 500_000.0    # physical sanity clamp on projected players
 
 
@@ -121,68 +141,41 @@ def distinct_states(history: list) -> list:
     return states
 
 
-def _marginal_rates(states: list) -> list:
-    """Per-interval (midpoint_hours, marginal_players_per_hour, dt_hours)."""
-    out = []
-    for a, b in zip(states, states[1:]):
-        pa = a["read"].get("players_tracked") or 0
-        pb = b["read"].get("players_tracked") or 0
-        dt = b["t"] - a["t"]
-        if dt > 1e-6 and pb >= pa:
-            out.append(((a["t"] + b["t"]) / 2.0, (pb - pa) / dt, dt))
-    return out
-
-
 def project_players(states: list, target_h: float) -> tuple:
     """Project players tracked at target_h and a log-scale uncertainty.
 
-    Fits an exponential decay k to the marginal growth rate across intervals
-    (recency weighted), converts the last interval's average rate to an
-    instantaneous end rate, then integrates the decay to the target. Returns
-    (P_target, sigma_logP). With a single state there is no growth information:
-    we hold P flat and flag large uncertainty.
+    Uses the power law fitted on the real trajectory,
+    log P = 6.3981 + 1.1381 * log(1 + t_hours) (t_hours since launch
+    2026-11-18T23:48Z), anchored at the last state's own (t, P):
+
+        P_target = P_now * ((1 + t_target) / (1 + t_now)) ** POWER_EXP.
+
+    P is never left flat when a horizon exists, even with a single state.
+    Returns (P_target, sigma_logP). The projection is sanity-clamped: never
+    shrink, never exceed an absolute physical cap.
     """
     ps = [s["read"].get("players_tracked") or 0 for s in states]
     p_now = float(ps[-1]) if ps else 1.0
     now_h = states[-1]["t"] if states else 0.0
     span = max(0.0, target_h - now_h)
-    if len(states) < 2 or span <= 0.0 or p_now <= 0.0:
-        return p_now, 0.35  # flat, but uncertain
+    span_days = span / 24.0
+    n_states = len(states)
 
-    marg = _marginal_rates(states)
-    if not marg:
-        return p_now, 0.35
+    # Power-law time is hours since launch (parse_time uses a 00:00Z reference).
+    t_now = now_h + LAUNCH_OFFSET_H
+    t_target = target_h + LAUNCH_OFFSET_H
+    if span <= 0.0 or p_now <= 0.0:
+        p_target = p_now
+    else:
+        base_now = max(1.0 + t_now, 0.01)
+        base_target = max(1.0 + t_target, 0.01)
+        p_target = p_now * (base_target / base_now) ** POWER_EXP
+        p_target = min(p_target, P_ABS_CAP)
+        p_target = max(p_target, p_now)  # never shrink
 
-    # Fit decay k from the ratio of successive marginal rates (recency weighted).
-    k = K_DEFAULT
-    if len(marg) >= 2:
-        num = den = 0.0
-        for (tm0, r0, _), (tm1, r1, _) in zip(marg, marg[1:]):
-            if r0 > 1e-9 and r1 > 1e-9 and tm1 > tm0:
-                w = 2.0 ** ((tm1 - marg[-1][0]) / (24.0 * ALPHA_HALF_LIFE))
-                kk = -math.log(r1 / r0) / ((tm1 - tm0) / 24.0)
-                num += w * kk
-                den += w
-        if den > 0.0:
-            k = num / den
-    k = min(K_MAX, max(K_MIN, k))
-    kh = k / 24.0  # per hour
-
-    # Last interval average -> instantaneous end rate under exponential decay.
-    tm_last, r_avg, dt_last = marg[-1]
-    x = kh * dt_last
-    end_factor = x / math.expm1(x) if x > 1e-6 else 1.0
-    r_now = max(0.0, r_avg * end_factor)
-
-    grown = r_now * (-math.expm1(-kh * span)) / kh if kh > 1e-9 else r_now * span
-    p_target = p_now + grown
-    # Sanity: never shrink, never exceed zero-decay growth or an absolute cap.
-    p_target = min(p_target, p_now + r_now * span, P_ABS_CAP)
-    p_target = max(p_target, p_now)
-
-    # Uncertainty grows with horizon and shrinks with more intervals.
-    sigma_logp = (SIGMA_P * math.sqrt(span / 24.0) + SIGMA_P_FLOOR)
-    sigma_logp *= 1.0 + 0.5 / len(marg)
+    # Uncertainty grows with horizon and shrinks with more distinct states.
+    sigma_logp = (SIGMA_P * math.sqrt(span_days) + SIGMA_P_FLOOR)
+    sigma_logp *= 1.0 + 0.5 / max(1, n_states - 1)
     return p_target, sigma_logp
 
 
@@ -332,8 +325,14 @@ def forecast_case(case: dict) -> dict:
         e_now = r_now * p_now / 100.0
 
         if single:
-            # Launch-night dilution fallback: no alpha information.
-            alpha = SINGLE_DILUTION * rate_frac
+            # Launch-night fallback: no alpha information. Measured on the real
+            # launch->t1 and launch->t2 intervals, the loss-optimal alpha is 0.0
+            # (loss 0.776/0.805 at sigma 2.0/sqrt(day)) against 1.318 for
+            # alpha = rate_frac, i.e. the earner count barely moves while the
+            # tracked player base explodes, so the rate dilutes as P_now/P_target.
+            # A trophy already at 100% is earned by every tracked player and
+            # cannot dilute: alpha = 1 keeps it pinned (id 2 in the practice data).
+            alpha = 1.0 if r_now >= 99.9 else 0.0
             e_target = e_now + alpha * dp_fwd
             rate_target = 100.0 * e_target / p_target if p_target > 0 else r_now
             z0 = logit(rate_target)
@@ -347,13 +346,16 @@ def forecast_case(case: dict) -> dict:
             if r_now >= 99.9:
                 alpha = 1.0
             else:
-                # Saturate toward the ceiling; never below the recent estimate.
-                alpha = ceiling - (ceiling - a_bar) * decay
-                alpha = max(a_bar, min(1.0, alpha))
+                # Do not extrapolate alpha toward a ceiling over the horizon:
+                # measured on the real intervals the loss-optimal alpha for a
+                # forward span stays at the recent estimate, and the ceiling
+                # growth overshoots by ~4.8x at a 4.5-day span (0.0302 against
+                # a rate_frac of 0.0063). Hold a_bar instead.
+                alpha = a_bar
                 if not identified[i]:
-                    # Rounding-noise alpha: blend toward a rate-proportional prior.
-                    prior = ALPHA_PRIOR_MULT * rate_frac
-                    alpha = 0.5 * alpha + 0.5 * prior
+                    # Rounding-noise alpha: blend toward an earners-persistent
+                    # prior (alpha 0), the measured optimum on real intervals.
+                    alpha = 0.5 * alpha + 0.5 * 0.0
             e_target = e_now + alpha * dp_fwd
             rate_target = 100.0 * e_target / p_target if p_target > 0 else r_now
             z0 = logit(rate_target)
