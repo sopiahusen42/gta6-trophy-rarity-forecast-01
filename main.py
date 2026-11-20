@@ -304,9 +304,9 @@ def forecast_case(case: dict) -> dict:
     intervals = _interval_alphas(states, n)
     alpha_bar, identified, beta = estimate_alpha(intervals, n, rates_now, p_now)
 
-    # Forecast span from the last interval midpoint (where alpha_bar is centred).
-    last_tm = intervals[-1]["tm"] if intervals else now_h
-    fwd_days = max(0.0, (target_h - last_tm) / 24.0)
+    # Forecast span from now (the last state): alpha_bar is our best estimate of
+    # the current marginal propensity, so we mature it forward from now.
+    fwd_days = max(0.0, (target_h - now_h) / 24.0)
     decay = math.exp(-beta * fwd_days)
 
     n_states = len(states)
