@@ -93,6 +93,7 @@ SINGLE_SIGMA_SQRT = 0.30
 # --- players projection (power law on the real trajectory) ----------------
 # log P = 6.3981 + 1.1381 * log(1 + t_hours), t_hours since 2026-11-18T23:48Z.
 POWER_EXP = 1.138        # fitted power-law exponent
+LOG_P_INTERCEPT = 6.3981  # fitted intercept: log P = 6.3981 + 1.1381*log(1+t_h)
 LAUNCH_OFFSET_H = 0.2    # hours from 2026-11-18T23:48Z to parse_time's 00:00Z ref
 P_ABS_CAP = 500_000.0    # physical sanity clamp on projected players
 
@@ -146,13 +147,23 @@ def project_players(states: list, target_h: float) -> tuple:
 
     Uses the power law fitted on the real trajectory,
     log P = 6.3981 + 1.1381 * log(1 + t_hours) (t_hours since launch
-    2026-11-18T23:48Z), anchored at the last state's own (t, P):
+    2026-11-18T23:48Z), evaluated at ABSOLUTE time:
 
-        P_target = P_now * ((1 + t_target) / (1 + t_now)) ** POWER_EXP.
+        P_target = exp(6.3981 + 1.1381 * log(1 + t_target)).
 
-    P is never left flat when a horizon exists, even with a single state.
+    The curve is global, not anchored at a state, because a state's own
+    players_tracked goes stale: a refresh lags hours behind the page, so a
+    history can sit flat at the launch plateau (638 players at t=2.5h) while
+    the real curve is already at 2,500. Anchoring at that stale reading
+    projected 1,043 players at a target where Exophase actually held 3,868, a
+    73% miss; the fitted curve evaluated at the same absolute time gives 4,354,
+    a 13% miss. On the four real points the curve is within +0.6%, +12.6%,
+    -9.4% and +4.2%.
+
+    P is never left flat when a horizon exists, even with a single state, and
+    never projects below the players already seen.
     Returns (P_target, sigma_logP). The projection is sanity-clamped: never
-    shrink, never exceed an absolute physical cap.
+    shrink below p_now, never exceed an absolute physical cap.
     """
     ps = [s["read"].get("players_tracked") or 0 for s in states]
     p_now = float(ps[-1]) if ps else 1.0
@@ -162,16 +173,14 @@ def project_players(states: list, target_h: float) -> tuple:
     n_states = len(states)
 
     # Power-law time is hours since launch (parse_time uses a 00:00Z reference).
-    t_now = now_h + LAUNCH_OFFSET_H
     t_target = target_h + LAUNCH_OFFSET_H
-    if span <= 0.0 or p_now <= 0.0:
+    if p_now <= 0.0:
         p_target = p_now
     else:
-        base_now = max(1.0 + t_now, 0.01)
         base_target = max(1.0 + t_target, 0.01)
-        p_target = p_now * (base_target / base_now) ** POWER_EXP
+        p_target = math.exp(LOG_P_INTERCEPT + POWER_EXP * math.log(base_target))
         p_target = min(p_target, P_ABS_CAP)
-        p_target = max(p_target, p_now)  # never shrink
+        p_target = max(p_target, p_now)  # never shrink below what we have seen
 
     # Uncertainty grows with horizon and shrinks with more distinct states.
     sigma_logp = (SIGMA_P * math.sqrt(span_days) + SIGMA_P_FLOOR)
