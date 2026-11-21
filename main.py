@@ -151,19 +151,23 @@ def project_players(states: list, target_h: float) -> tuple:
 
         P_target = exp(6.3981 + 1.1381 * log(1 + t_target)).
 
-    The curve is global, not anchored at a state, because a state's own
-    players_tracked goes stale: a refresh lags hours behind the page, so a
-    history can sit flat at the launch plateau (638 players at t=2.5h) while
-    the real curve is already at 2,500. Anchoring at that stale reading
-    projected 1,043 players at a target where Exophase actually held 3,868, a
-    73% miss; the fitted curve evaluated at the same absolute time gives 4,354,
-    a 13% miss. On the four real points the curve is within +0.6%, +12.6%,
-    -9.4% and +4.2%.
+    Which anchor is used depends on whether the history actually moved:
 
-    P is never left flat when a horizon exists, even with a single state, and
-    never projects below the players already seen.
-    Returns (P_target, sigma_logP). The projection is sanity-clamped: never
-    shrink below p_now, never exceed an absolute physical cap.
+    * A history with two or more distinct players_tracked readings is current:
+      Exophase has refreshed inside it, so its last read is a real datum and it
+      is anchored - P_target = p_now * ((1 + t_target) / (1 + t_now)) ** EXP.
+      The final's history is like this and ends minutes before its checkpoint,
+      so its newest reading is the best estimate of P now.
+    * A history whose readings all show the same players_tracked is stale: a
+      refresh lags hours behind the page, so the count sat at one plateau while
+      the real curve ran ahead. Anchoring on that plateau projected 1,043
+      players at a target where Exophase actually held 3,868, a 73% miss; the
+      fitted curve at the same absolute time gives 4,354, a 13% miss. On the
+      four real points the curve is within +0.6%, +12.6%, -9.4% and +4.2%.
+
+    P is never left flat when a horizon exists, never projects below the players
+    already seen. Returns (P_target, sigma_logP). The projection is
+    sanity-clamped: never shrink below p_now, never exceed a physical cap.
     """
     ps = [s["read"].get("players_tracked") or 0 for s in states]
     p_now = float(ps[-1]) if ps else 1.0
@@ -171,11 +175,27 @@ def project_players(states: list, target_h: float) -> tuple:
     span = max(0.0, target_h - now_h)
     span_days = span / 24.0
     n_states = len(states)
+    current = len(set(ps)) >= 2
 
     # Power-law time is hours since launch (parse_time uses a 00:00Z reference).
+    t_now = now_h + LAUNCH_OFFSET_H
     t_target = target_h + LAUNCH_OFFSET_H
     if p_now <= 0.0:
         p_target = p_now
+    elif current:
+        # Anchor at the last real read, then shrink halfway toward the fitted
+        # curve: a read is the page as Exophase last refreshed it, so it lags
+        # the live count, and on the real points the curve sits 0.6-12.6% above
+        # the read at each read's own time. Shrinking half way keeps the read's
+        # information without inheriting its whole lag, and it bounds the
+        # damage if the newest read happens to be the stale one.
+        base_now = max(1.0 + t_now, 0.01)
+        base_target = max(1.0 + t_target, 0.01)
+        anchor = p_now * (base_target / base_now) ** POWER_EXP
+        curve = math.exp(LOG_P_INTERCEPT + POWER_EXP * math.log(base_target))
+        p_target = math.sqrt(max(anchor, 1e-9) * max(curve, 1e-9))
+        p_target = min(p_target, P_ABS_CAP)
+        p_target = max(p_target, p_now)
     else:
         base_target = max(1.0 + t_target, 0.01)
         p_target = math.exp(LOG_P_INTERCEPT + POWER_EXP * math.log(base_target))
@@ -341,6 +361,7 @@ def forecast_case(case: dict) -> dict:
             # tracked player base explodes, so the rate dilutes as P_now/P_target.
             # A trophy already at 100% is earned by every tracked player and
             # cannot dilute: alpha = 1 keeps it pinned (id 2 in the practice data).
+            # Measured on the real Exophase intervals, not on the practice.
             alpha = 1.0 if r_now >= 99.9 else 0.0
             e_target = e_now + alpha * dp_fwd
             rate_target = 100.0 * e_target / p_target if p_target > 0 else r_now
